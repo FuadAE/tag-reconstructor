@@ -1,0 +1,904 @@
+---
+title: "tag-reconstructor"
+author: "Fuad Ale-Enriquez"
+date: "2025-05-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+set.seed (150877)
+```
+
+# Overview
+
+This project implements a bottom-up optimization framework to reconstruct a combinatorial set of triacylglyceride (TAG) molecules that best reproduces an experimental fatty acid methyl ester (FAME) profile.
+
+Starting from measured FAME proportions, the method identifies the optimal combination and relative abundances of TAGs whose collective fatty acid composition matches the observed data.
+
+## Required Input
+
+The pipeline requires a tidy dataset containing fatty acid (FAME) proportions with, at minimum, the following columns:
+
+- `Treatment_ID` — experimental condition or sample label  
+- `Type` — sample grouping (e.g., treatment class)  
+- `FAME` — fatty acid identifier (e.g., C18:1)  
+- `Mean_abundance` — abundance or proportion of each fatty acid  
+- `rank` — optional ranking of fatty acids by abundance  
+
+## Workflow
+
+The analysis consists of four main steps:
+
+1. **TAG combinatorial generation**  
+   Construct all candidate TAG molecules from the observed fatty acid pool.
+
+2. **Optimization of TAG mixtures**  
+   Identify a minimal set of TAGs and their proportions that best approximate the experimental FAME profile.
+
+3. **Mass-based conversion to FAME composition**  
+   Translate TAG mixtures into predicted FAME distributions using molecular mass relationships.
+
+4. **Comparison with experimental data**  
+   Evaluate model performance using quantitative metrics and visual diagnostics against GC-FID measurements.
+   
+This approach provides a mechanistic link between TAG composition and measurable fatty acid profiles, enabling interpretation and simulation of lipid systems.
+
+
+# Libraries
+```{r}
+library(gtools)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(scales)
+library(cowplot)
+library(openxlsx)
+
+pkgs <- c("gtools","dplyr","tidyr","stringr","purrr","tibble","ggplot2","scales","cowplot","openxlsx")
+missing <- pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]
+if (length(missing)) stop("Missing packages: ", paste(missing, collapse = ", "))
+```
+
+# Functions
+
+## 1. Build experimental composition per (Treatment_ID, Type)
+
+**Default top_n FAME = 12**
+
+**normalize = FALSE is default. Change to TRUE only if Mean_abundance is given as concentration (absolute) and the sum within each sample is not equal to 1**
+
+**use_rank = TRUE is default**
+
+```{r}
+get_exp_composition_for_group <- function(top_by_group, treatment_id, type,
+                                         top_n = 12, normalize = FALSE, use_rank = TRUE) {
+  stopifnot(all(c("Treatment_ID","Type","FAME","Mean_abundance","rank") %in% names(top_by_group)))
+  df <- subset(top_by_group, Treatment_ID == treatment_id & Type == type)
+  if (nrow(df) == 0) stop(sprintf("No rows for Treatment_ID=%s, Type=%s", treatment_id, type))
+
+  # Select top_n fatty acids
+  if (use_rank) {
+    df <- df[order(df$rank), ]
+  } else {
+    df <- df[order(df$Mean_abundance, decreasing = TRUE), ]
+  }
+  df <- head(df, top_n)
+
+  df$FAME <- as.character(df$FAME)
+  df$Mean_abundance <- as.numeric(df$Mean_abundance)
+
+  comp <- tapply(df$Mean_abundance, df$FAME, sum)
+  comp[is.na(comp)] <- 0
+
+  if (normalize) {
+    s <- sum(comp)
+    if (s <= 0) stop("Sum of Mean_abundance for selected FAs is zero.")
+    comp <- comp / s
+  }
+
+  list(fatty_acids = names(comp), exp_composition = comp)
+}
+```
+
+
+## 2. Generate TAG candidates (3 FA per TAG), allowing FA repetition. Collapses stereoisomers by sorting within TAG
+
+```{r}
+generate_TAGs_with_repeat <- function(fatty_acids) {
+  cmb <- gtools::combinations(length(fatty_acids), 3, v = fatty_acids, repeats.allowed = TRUE)
+  TAGs <- unique(t(apply(cmb, 1, function(row) sort(as.character(row)))))
+  storage.mode(TAGs) <- "character"
+  TAGs
+}
+
+generate_TAGs_no_repeat <- function(fatty_acids) {
+  TAGs <- t(combn(fatty_acids, 3, simplify = TRUE))
+  storage.mode(TAGs) <- "character"
+  TAGs
+}
+```
+
+
+## 3. Convert a TAG into a composition vector over the FA universe (fractions over that TAG’s 3 positions; sums to 1 across FAs present in the universe)
+```{r}
+tag_comp <- function(tag_vec, fa_univ) {
+  tg <- as.character(tag_vec)
+  composition <- table(tg) / length(tg)  # divide by 3
+  full <- setNames(rep(0, length(fa_univ)), fa_univ)
+  common <- intersect(names(composition), fa_univ)
+  if (length(common) > 0) full[common] <- as.numeric(composition[common])
+  full
+}
+```
+
+
+## 4. Objective for K-TAG mixture with scale handling and FA weights
+```{r}
+objective_Ktag <- function(x, C_list, exp_comp,
+                           metric = "L1", fa_w = NULL,
+                           scale_mode = c("match_sum","free")) {
+  scale_mode <- match.arg(scale_mode)
+  exp_names <- names(exp_comp)
+  P <- length(exp_comp)
+
+  # Align C_list to exp_comp names/order
+  C_list_aligned <- lapply(C_list, function(v) {
+    if (identical(names(v), exp_names)) return(v)
+    vv <- setNames(rep(0, P), exp_names)
+    common <- intersect(names(v), exp_names)
+    if (length(common) > 0) vv[common] <- v[common]
+    vv
+  })
+
+  Cmat <- do.call(rbind, C_list_aligned)
+
+  K <- length(C_list_aligned)
+  logits <- c(if (K > 1) x[1:(K-1)] else numeric(0), 0)
+  p <- exp(logits - max(logits)); p <- p / sum(p)
+  dim(p) <- c(1L, length(p))
+
+  pred_frac <- as.vector(p %*% Cmat)
+
+  if (scale_mode == "match_sum") {
+    S <- sum(exp_comp)
+    pred <- S * pred_frac
+  } else {
+    log_s <- if (length(x) >= K) x[K] else 0
+    s <- exp(log_s)
+    pred <- s * pred_frac
+  }
+
+  if (!is.null(fa_w)) {
+    fa_w <- fa_w[exp_names]
+    fa_w[is.na(fa_w)] <- 1
+  }
+
+  if (metric == "SSE") {
+    res <- (pred - exp_comp)^2
+    if (!is.null(fa_w)) res <- fa_w * res
+    sum(res)
+  } else {
+    res <- abs(pred - exp_comp)
+    if (!is.null(fa_w)) res <- fa_w * res
+    sum(res)
+  }
+}
+```
+
+## 5. Optimize weights for a given TAG set; multi-start
+```{r}
+optimize_one_Ktag_combo <- function(TAG_list, fa_univ, exp_comp,
+                                   metric = "L1", fa_w = NULL,
+                                   scale_mode = "match_sum",
+                                   n_starts = 5, start_scale = 1.0,
+                                   brent_logit_bounds = c(-20, 20)) {
+  K <- length(TAG_list)
+  C_list <- lapply(TAG_list, function(tg) tag_comp(tg, fa_univ))
+
+  # K=1 closed form
+  if (K == 1) {
+    pred_frac <- C_list[[1]]
+    s <- sum(exp_comp)
+    pred <- s * pred_frac
+
+    fa_w_loc <- if (!is.null(fa_w)) { w <- fa_w[names(exp_comp)]; w[is.na(w)] <- 1; w } else NULL
+
+    if (metric == "SSE") {
+      res <- (pred - exp_comp)^2
+      if (!is.null(fa_w_loc)) res <- fa_w_loc * res
+      err <- sum(res)
+    } else {
+      res <- abs(pred - exp_comp)
+      if (!is.null(fa_w_loc)) res <- fa_w_loc * res
+      err <- sum(res)
+    }
+
+    return(list(weights = 1, scale = s, error = err, convergence = 0))
+  }
+
+  dim_logits <- K - 1
+  add_scale <- (scale_mode == "free")
+
+  # Special case: K=2, match_sum => 1D Brent
+  if (dim_logits == 1 && !add_scale) {
+    oneD_obj <- function(t) {
+      objective_Ktag(x = c(t), C_list = C_list, exp_comp = exp_comp,
+                     metric = metric, fa_w = fa_w, scale_mode = scale_mode)
+    }
+    opt_res <- optimize(oneD_obj, interval = brent_logit_bounds)
+    logits <- c(opt_res$minimum, 0)
+    p <- exp(logits - max(logits)); p <- p / sum(p)
+    return(list(weights = p, scale = sum(exp_comp), error = opt_res$objective, convergence = 0))
+  }
+
+  # Multi-start Nelder–Mead
+  build_starts <- function(dim_logits, add_scale) {
+    base <- diag(dim_logits) * 0.5
+    base <- rbind(rep(0, dim_logits), base)
+    if (n_starts > nrow(base)) {
+      extra <- matrix(rnorm((n_starts - nrow(base)) * dim_logits, sd = start_scale),
+                      ncol = dim_logits)
+      starts <- rbind(base, extra)
+    } else {
+      starts <- base[seq_len(n_starts), , drop = FALSE]
+    }
+    if (add_scale) {
+      S0 <- sum(exp_comp)
+      starts <- cbind(starts, rep(log(max(S0, .Machine$double.eps)), nrow(starts)))
+    }
+    starts
+  }
+
+  starts <- build_starts(dim_logits, add_scale)
+  best <- list(value = Inf, par = NULL, conv = NA_integer_)
+
+  for (i in seq_len(nrow(starts))) {
+    res <- optim(
+      par = starts[i, ],
+      fn  = objective_Ktag,
+      C_list = C_list,
+      exp_comp = exp_comp,
+      metric = metric,
+      fa_w = fa_w,
+      scale_mode = scale_mode,
+      method = "Nelder-Mead",
+      control = list(maxit = 6000)
+    )
+    if (res$value < best$value) best <- list(value = res$value, par = res$par, conv = res$convergence)
+  }
+
+  logits <- c(best$par[1:dim_logits], 0)
+  p <- exp(logits - max(logits)); p <- p / sum(p)
+
+  s <- if (scale_mode == "match_sum") {
+    sum(exp_comp)
+  } else {
+    exp(best$par[dim_logits + 1])
+  }
+
+  list(weights = p, scale = s, error = best$value, convergence = best$conv)
+}
+```
+
+
+## 6. Candidate ranking and greedy forward selection
+```{r}
+rank_TAG_candidates <- function(TAGs, fatty_acids, exp_comp) {
+  exp_frac <- exp_comp / sum(exp_comp)
+  scores <- apply(TAGs, 1, function(tag) {
+    cvec <- tag_comp(tag, fatty_acids)
+    num <- sum(cvec * exp_frac)
+    den <- sqrt(sum(cvec^2)) * sqrt(sum(exp_frac^2))
+    if (den == 0) 1 else (1 - num / den)
+  })
+  ord <- order(scores)
+  list(order = ord, scores = scores)
+}
+
+run_K_TAG_search_greedy <- function(fatty_acids, exp_comp,
+                                   K = 5,
+                                   metric = "L1", fa_w = NULL,
+                                   scale_mode = "match_sum",
+                                   n_starts = 5,
+                                   allow_within_TAG_repeat = TRUE,
+                                   candidate_limit = 120) {
+
+  TAGs <- if (allow_within_TAG_repeat) {
+    generate_TAGs_with_repeat(fatty_acids)
+  } else {
+    generate_TAGs_no_repeat(fatty_acids)
+  }
+  if (nrow(TAGs) == 0) stop("No TAG candidates.")
+
+  rk <- rank_TAG_candidates(TAGs, fatty_acids, exp_comp)
+  ord <- rk$order
+  keep_n <- min(candidate_limit, length(ord))
+  pool <- TAGs[ord[seq_len(keep_n)], , drop = FALSE]
+
+  selected <- list()
+  selected_rows <- integer(0)
+  best_opt <- NULL
+
+  for (t in 1:K) {
+    best_t <- list(err = Inf, row = NA, opt = NULL)
+
+    for (r in seq_len(nrow(pool))) {
+      if (r %in% selected_rows) next
+      trial_list <- c(selected, list(pool[r, ]))
+      opt <- optimize_one_Ktag_combo(
+        TAG_list = trial_list,
+        fa_univ = fatty_acids,
+        exp_comp = exp_comp,
+        metric = metric, fa_w = fa_w,
+        scale_mode = scale_mode,
+        n_starts = n_starts
+      )
+      if (opt$error < best_t$err) best_t <- list(err = opt$error, row = r, opt = opt)
+    }
+
+    selected <- c(selected, list(pool[best_t$row, ]))
+    selected_rows <- c(selected_rows, best_t$row)
+    best_opt <- best_t$opt
+  }
+
+  sel_TAGs <- selected
+  names(sel_TAGs) <- paste0("T", seq_len(K))
+  w <- best_opt$weights
+  scl <- best_opt$scale
+
+  C_list <- lapply(sel_TAGs, function(tg) tag_comp(tg, fatty_acids))
+  Cmat <- do.call(rbind, C_list)
+  pred_abs <- as.numeric(scl * (w %*% Cmat))
+  names(pred_abs) <- fatty_acids
+
+  list(
+    TAGs = sel_TAGs,
+    weights = w,
+    scale = scl,
+    error = best_opt$error,
+    convergence = best_opt$convergence,
+    predicted_absolute = pred_abs
+  )
+}
+```
+
+
+## 7. Run per (Treatment_ID, Type) across data
+```{r}
+run_all_groups_5TAG <- function(top_by_group,
+                               top_n = 12, normalize = FALSE, use_rank = TRUE,
+                               metric = "L1", fa_w = NULL,
+                               scale_mode = "match_sum",
+                               n_starts = 5,
+                               allow_within_TAG_repeat = TRUE,
+                               candidate_limit = 120) {
+
+  groups <- unique(top_by_group[, c("Treatment_ID","Type")])
+  groups$Treatment_ID <- as.character(groups$Treatment_ID)
+  groups$Type <- as.character(groups$Type)
+
+  out <- vector("list", nrow(groups))
+  predicted_list <- vector("list", nrow(groups))
+  residuals_list <- vector("list", nrow(groups))
+
+  for (g in seq_len(nrow(groups))) {
+    trt <- groups$Treatment_ID[g]
+    typ <- groups$Type[g]
+
+    exp_info <- get_exp_composition_for_group(
+      top_by_group, trt, typ,
+      top_n = top_n, normalize = normalize, use_rank = use_rank
+    )
+
+    fatty_acids <- exp_info$fatty_acids
+    exp_comp <- exp_info$exp_composition[fatty_acids]
+    total_exp <- sum(exp_comp)
+    FA_count <- length(fatty_acids)
+
+    fit <- run_K_TAG_search_greedy(
+      fatty_acids = fatty_acids,
+      exp_comp = exp_comp,
+      K = 5,
+      metric = metric,
+      fa_w = fa_w,
+      scale_mode = scale_mode,
+      n_starts = n_starts,
+      allow_within_TAG_repeat = allow_within_TAG_repeat,
+      candidate_limit = candidate_limit
+    )
+
+    TAG_strings <- vapply(fit$TAGs, function(tg) paste(as.character(tg), collapse = "-"), character(1))
+    ws <- fit$weights
+    resid <- fit$predicted_absolute - exp_comp
+    avg_error_perFA <- if (FA_count > 0) fit$error / FA_count else NA_real_
+
+    out[[g]] <- data.frame(
+      Treatment_ID = trt,
+      Type = typ,
+      FA_count = FA_count,
+      exp_sum = total_exp,
+      TAG1 = TAG_strings[1],
+      TAG2 = TAG_strings[2],
+      TAG3 = TAG_strings[3],
+      TAG4 = TAG_strings[4],
+      TAG5 = TAG_strings[5],
+      w1 = ws[1], w2 = ws[2], w3 = ws[3], w4 = ws[4], w5 = ws[5],
+      scale = fit$scale,
+      error = fit$error,
+      avg_error_perFA = avg_error_perFA,
+      convergence = fit$convergence,
+      stringsAsFactors = FALSE
+    )
+
+    predicted_list[[g]] <- tibble(
+      Treatment_ID = trt, Type = typ,
+      FAME = names(fit$predicted_absolute),
+      predicted = as.numeric(fit$predicted_absolute)
+    )
+
+    residuals_list[[g]] <- tibble(
+      Treatment_ID = trt, Type = typ,
+      FAME = names(resid),
+      residual = as.numeric(resid)
+    )
+  }
+
+  res <- do.call(rbind, out)
+
+  # Attach detail tables safely to the returned object
+  attr(res, "predicted_list") <- bind_rows(predicted_list)
+  attr(res, "residuals_list") <- bind_rows(residuals_list)
+
+  res
+}
+```
+
+
+# USAGE EXAMPLE - Computation (GitHub-friendly)
+
+## IMPORT
+```{r}
+# =========================
+# Data loader: use object if present, else read from repo file
+# If running on R Studio environment it is better to import top12_by_group and FAMEprofile prior running this chunk
+# =========================
+
+load_or_read <- function(object_name, file_path, required = TRUE) {
+  if (exists(object_name, envir = .GlobalEnv)) {
+    message("Using existing object: ", object_name)
+    return(get(object_name, envir = .GlobalEnv))
+  }
+  if (file.exists(file_path)) {
+    message("Reading from file: ", file_path)
+    return(read.csv(file_path, stringsAsFactors = FALSE))
+  }
+  if (required) {
+    stop("Missing required input: '", object_name, "'. ",
+         "Provide it in the environment or add file: ", file_path)
+  } else {
+    message("Optional input not found: ", object_name, 
+            ". Skipping sections that require it.")
+    return(NULL)
+  }
+}
+
+# Required input for fitting
+top_by_group <- load_or_read("top12_by_group", file.path("data", "example_top12_by_group.csv"), required = TRUE)
+
+# Optional input for triplicate-vs-sim evaluation plots
+FAMEprofile <- load_or_read("FAMEprofile", file.path("data", "example_FAMEprofile.csv"), required = FALSE)
+```
+
+
+## SIMULATION
+```{r}
+#Run the pipeline
+set.seed(150877)  # for reproducibility of starts
+
+results_5TAG <- run_all_groups_5TAG(
+  top_by_group = top_by_group,  # your existing data frame
+  top_n = 12,
+  normalize = FALSE,        
+  use_rank = TRUE,
+  metric = "SSE",            
+  fa_w = NULL,              
+  scale_mode = "match_sum", 
+  n_starts = 8,
+  allow_within_TAG_repeat = TRUE,
+  candidate_limit = 200
+)
+
+print(head(results_5TAG))
+
+# Access extra outputs (if you used the attr() fix)
+pred_list  <- attr(results_5TAG, "predicted_list")
+resid_list <- attr(results_5TAG, "residuals_list")
+```
+
+## EXPORTING SIMULATED TAG RESULTS
+```{r}
+dir.create("outputs", showWarnings = FALSE)
+dir.create(file.path("outputs", "tables"), showWarnings = FALSE, recursive = TRUE)
+
+# If you used the improved run_all_groups_5TAG() that stores these as attributes:
+pred_list  <- attr(results_5TAG, "predicted_list")
+resid_list <- attr(results_5TAG, "residuals_list")
+
+wb <- createWorkbook()
+
+addWorksheet(wb, "summary")
+writeData(wb, "summary", results_5TAG)
+
+if (!is.null(pred_list)) {
+  addWorksheet(wb, "predicted")
+  writeData(wb, "predicted", pred_list)
+}
+
+if (!is.null(resid_list)) {
+  addWorksheet(wb, "residuals")
+  writeData(wb, "residuals", resid_list)
+}
+
+saveWorkbook(
+  wb,
+  file = file.path("outputs", "tables", "results_5TAG_with_extra.xlsx"),
+  overwrite = TRUE
+)
+```
+
+
+## SIMULATION FITNESS EXAMPLE - Three technical replicates vs. simulated example - ice cream waste paper
+**Requires pipeline output "results_5TAG" + compatible unsummarized FAME profile "FAMEprofile"**
+
+### Computing simulation fitness
+```{r}
+stopifnot(exists("results_5TAG"))
+
+if (is.null(FAMEprofile)) {
+  message("FAMEprofile not available. Skipping triplicate-vs-simulated fitness section.")
+  knitr::knit_exit()
+}
+
+theme_set(theme_minimal(base_size = 12))
+
+# Color-blind safe palette
+col_exp <- "#0072B2"  # experimental dots
+col_sim <- "#E69F00"  # simulated diamonds
+
+# Controls
+THRESH   <- 1.1        # filter experimental points below this % (w/w)
+ORDER_BY <- "exp_mean" # exp_mean or sim_mean
+
+# -------------------------
+# Label utilities (define ONCE)
+# -------------------------
+sanitize_label <- function(x) {
+  x %>%
+    str_replace_all("[\\u00A0\\u2007\\u202F\\u200B\\uFEFF]", " ") %>%
+    str_replace_all("[\\u2010\\u2011\\u2012\\u2013\\u2014\\u2212]", "-") %>%
+    str_replace_all("\\s+", " ") %>%
+    str_replace_all("\\(\\s+", "(") %>%
+    str_replace_all("\\s+\\)", ")") %>%
+    str_trim()
+}
+
+repair_label <- function(x) {
+  x %>%
+    str_replace("\\bUnknown\\s*3\\b", "C18:1 (E9)") %>%
+    str_replace("C22:2\\s*\\?\\?\\?", "C22:2 (Z13,16)")
+}
+
+repair_sim_tag <- function(tag_vec) {
+  tag_vec %>%
+    str_squish() %>%
+    str_replace("\\bUnknown\\s*3\\b", "C18:1 (E9)") %>%
+    str_replace("C22:2\\s*\\?\\?\\?", "C22:2 (Z13,16)")
+}
+
+# -------------------------
+# Chemistry helpers
+# -------------------------
+amu <- list(C = 12.011, H = 1.00794, O = 15.999)
+
+mw_fame <- function(n, d) {
+  C <- n + 1
+  H <- 2*n - 2*d + 2
+  O <- 2
+  C*amu$C + H*amu$H + O*amu$O
+}
+
+mw_tag <- function(n_vec, d_vec) {
+  sc <- sum(n_vec); sd <- sum(d_vec)
+  C <- 3 + sc
+  H <- 2 + 2*sc - 2*sd
+  O <- 6
+  C*amu$C + H*amu$H + O*amu$O
+}
+
+parse_chain <- function(x) {
+  x1 <- sanitize_label(x) %>% repair_label()
+  m  <- str_match(x1, "C(\\d+):(\\d+)")
+  if (any(is.na(m))) stop("Could not parse chain: ", x)
+  tibble(label = x1, n = as.integer(m[,2]), d = as.integer(m[,3]))
+}
+
+parse_tag <- function(tag_str) {
+  parts <- str_split(tag_str, "-", simplify = TRUE) %>% as.vector()
+  bind_rows(map(parts, parse_chain))
+}
+
+# -------------------------
+# Simulated (SAE): mass-correct %FAME from 1.000 g TAG mixture
+# -------------------------
+sim_fame_masscorrect <- results_5TAG %>%
+  filter(Type == "SAE") %>%
+  mutate(across(matches("^TAG\\d$"), ~ repair_sim_tag(.x))) %>%
+  pivot_longer(
+    cols = matches("^TAG\\d$|^w\\d$"),
+    names_to = c(".value","idx"),
+    names_pattern = "([A-Za-z]+)(\\d+)"
+  ) %>%
+  mutate(TAG = str_squish(TAG)) %>%
+  filter(!is.na(TAG), !is.na(w)) %>%
+  group_by(Treatment_ID) %>%
+  group_modify(~{
+    w_frac <- .x$w / sum(.x$w, na.rm = TRUE)  # normalize weights
+    .x2 <- mutate(.x, w_g = w_frac)          # grams TAG in 1.000 g mixture
+
+    contrib <- imap_dfr(.x2$TAG, function(tag_str, i) {
+      w_g  <- .x2$w_g[i]
+      ch   <- parse_tag(tag_str)
+      Mtag <- mw_tag(ch$n, ch$d)
+      nTAG <- if (Mtag > 0) w_g / Mtag else 0
+
+      ch %>%
+        mutate(label = sanitize_label(repair_label(label)),
+               mass_g = nTAG * mw_fame(n, d)) %>%
+        select(label, mass_g)
+    })
+
+    total_fame_g <- sum(contrib$mass_g, na.rm = TRUE)
+
+    contrib %>%
+      group_by(label) %>%
+      summarise(fame_g = sum(mass_g, na.rm = TRUE), .groups = "drop") %>%
+      mutate(`%FAME_sim_w` = 100 * fame_g / total_fame_g)
+  }) %>%
+  ungroup() %>%
+  group_by(Treatment_ID, label) %>%
+  summarise(`%FAME_sim_w` = sum(`%FAME_sim_w`), .groups = "drop") %>%
+  mutate(label = sanitize_label(repair_label(label)))
+
+# -------------------------
+# Experimental (SAE): %FAME as percent, filtered at THRESH
+# -------------------------
+exp_by_rep <- FAMEprofile %>%
+  filter(Type == "SAE") %>%
+  transmute(
+    Treatment_ID,
+    label_raw = sanitize_label(repair_label(`Peak#`)),
+    `%FAME_exp_w` = `%FAME` * 100,
+    Rep_ID = Lab_Tag
+  ) %>%
+  filter(`%FAME_exp_w` >= THRESH)
+
+# -------------------------
+# Shared axis ordering (global levels)
+# -------------------------
+exp_mean_global <- exp_by_rep %>%
+  group_by(label_raw) %>%
+  summarise(exp_mean = mean(`%FAME_exp_w`, na.rm = TRUE), .groups = "drop") %>%
+  transmute(label = sanitize_label(label_raw), exp_mean)
+
+sim_global <- sim_fame_masscorrect %>%
+  group_by(label) %>%
+  summarise(sim_mean = mean(`%FAME_sim_w`, na.rm = TRUE), .groups = "drop")
+
+all_labels <- union(sim_global$label, exp_mean_global$label) %>% sanitize_label()
+
+ord_df <- tibble(label = all_labels) %>%
+  left_join(exp_mean_global, by = "label") %>%
+  left_join(sim_global, by = "label") %>%
+  mutate(order_val = if (ORDER_BY == "exp_mean") ifelse(is.na(exp_mean), Inf, exp_mean)
+                     else ifelse(is.na(sim_mean), Inf, sim_mean)) %>%
+  arrange(order_val, label)
+
+levels_global <- unique(ord_df$label[nzchar(ord_df$label)])
+
+# Factorize for plotting
+sim_plot <- sim_fame_masscorrect %>%
+  mutate(FAME = factor(sanitize_label(label), levels = levels_global))
+
+exp_plot <- exp_by_rep %>%
+  mutate(FAME = factor(sanitize_label(label_raw), levels = levels_global))
+```
+
+### Plot example
+```{r}
+gg_rep_vs_sim <- ggplot() +
+  geom_point(
+    data = sim_plot,
+    aes(x = FAME, y = `%FAME_sim_w`, shape = "Simulated"),
+    size = 3.0, stroke = 0.3,
+    color = "grey20", fill = col_sim
+  ) +
+  geom_point(
+    data = exp_plot,
+    aes(x = FAME, y = `%FAME_exp_w`, shape = "Experimental"),
+    position = position_jitter(width = 0.10, height = 0, seed = 1),
+    size = 1.8, alpha = 0.65,
+    color = col_exp
+  ) +
+  coord_flip() +
+  scale_x_discrete(drop = FALSE) +
+  scale_y_continuous(labels = percent_format(scale = 1)) +
+  scale_shape_manual(
+    name   = NULL,
+    breaks = c("Experimental", "Simulated"),
+    labels = c("Experimental (GC-FID)", "Simulated"),
+    values = c("Experimental" = 16, "Simulated" = 23)
+  ) +
+  guides(
+    shape = guide_legend(
+      override.aes = list(
+        color = c(col_exp, "grey20"),
+        fill  = c(NA, col_sim),
+        size  = c(1.8, 3.0),
+        alpha = 1
+      )
+    )
+  ) +
+  labs(x = "Fatty acid residue", y = "Percent of total FAME (w/w)") +
+  facet_wrap(
+    ~Treatment_ID,
+    ncol = 2, scales = "free_y",
+    labeller = labeller(
+      Treatment_ID = c(
+        "High fat" = "High initial ICW fat content (8.0%w)",
+        "Low fat"  = "Low initial ICW fat content (4.5%w)"
+      )
+    )
+  ) +
+  theme(
+    legend.position = "top",
+    axis.text = element_text(color = "black"),
+    axis.text.y = element_text(size = 9),
+    panel.grid = element_blank(),
+    panel.grid.major.y = element_line(colour = alpha("grey40", 0.18), linewidth = 0.3),
+    axis.line = element_line(color = "black", linewidth = 0.45),
+    axis.ticks = element_line(color = "black", linewidth = 0.45),
+    strip.text = element_text(face = "bold"),
+    strip.background = element_rect(fill = "grey92", color = NA)
+  )
+
+gg_rep_vs_sim
+```
+
+### Fitness and diagnostic metrics
+```{r}
+# -------------------------
+# Align on shared axis per treatment
+# -------------------------
+grid_treat <- expand_grid(
+  Treatment_ID = sort(unique(c(sim_fame_masscorrect$Treatment_ID, exp_by_rep$Treatment_ID))),
+  FAME = factor(levels_global, levels = levels_global)
+)
+
+sim_mat_treat <- sim_fame_masscorrect %>%
+  mutate(FAME = factor(sanitize_label(label), levels = levels_global)) %>%
+  select(Treatment_ID, FAME, sim = `%FAME_sim_w`) %>%
+  right_join(grid_treat, by = c("Treatment_ID","FAME")) %>%
+  mutate(sim = coalesce(sim, 0))
+
+exp_mean_treat <- exp_by_rep %>%
+  mutate(FAME = factor(sanitize_label(label_raw), levels = levels_global)) %>%
+  group_by(Treatment_ID, FAME) %>%
+  summarise(exp = mean(`%FAME_exp_w`, na.rm = TRUE), .groups = "drop") %>%
+  right_join(grid_treat, by = c("Treatment_ID","FAME")) %>%
+  mutate(exp = coalesce(exp, 0))
+
+fit_treat_df <- sim_mat_treat %>%
+  left_join(exp_mean_treat, by = c("Treatment_ID","FAME"))
+
+metrics_from_vectors <- function(sim, exp) {
+  sim <- as.numeric(sim); exp <- as.numeric(exp)
+  rmse <- sqrt(mean((sim - exp)^2))
+  mae  <- mean(abs(sim - exp))
+  bias <- mean(sim - exp)
+  r <- if (sd(sim) > 0 && sd(exp) > 0) suppressWarnings(cor(sim, exp)) else NA_real_
+  denom <- sqrt(sum(sim^2)) * sqrt(sum(exp^2))
+  cosine <- if (denom > 0) sum(sim * exp) / denom else NA_real_
+  bc <- if (sum(sim + exp) > 0) sum(abs(sim - exp)) / sum(sim + exp) else NA_real_
+  tibble(RMSE = rmse, MAE = mae, Bias = bias, Pearson_r = r, Cosine = cosine, BrayCurtis = bc)
+}
+
+fitness_treatment <- fit_treat_df %>%
+  group_by(Treatment_ID) %>%
+  summarise(metrics_from_vectors(sim, exp), .groups = "drop")
+
+fitness_treatment
+
+facet_labeller <- labeller(
+  Treatment_ID = c(
+    "High fat" = "High initial ICW fat content (8.0%w)",
+    "Low fat"  = "Low initial ICW fat content (4.5%w)"
+  )
+)
+
+# Scatter
+scatter_df <- fit_treat_df %>% mutate(Exp_mean = exp, Sim = sim)
+
+gg_fitness_scatter <- ggplot(scatter_df, aes(x = Exp_mean, y = Sim)) +
+  geom_abline(slope = 1, intercept = 0, color = "grey60", linetype = "dashed") +
+  geom_point(size = 2.0, alpha = 0.85, color = "darkred") +
+  geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.6) +
+  scale_x_continuous(limits = c(0, 30), breaks = seq(0, 30, by = 5), labels = percent_format(scale = 1)) +
+  scale_y_continuous(limits = c(0, 30), breaks = seq(0, 30, by = 5), labels = percent_format(scale = 1)) +
+  labs(x = "Experimental percent of total FAME (w/w)",
+       y = "Simulated percent of total FAME (w/w)") +
+  facet_wrap(~Treatment_ID, ncol = 2, scales = "free_y", labeller = facet_labeller) +
+  theme(
+    panel.grid = element_blank(),
+    axis.line  = element_line(color = "black", linewidth = 0.45),
+    axis.ticks = element_line(color = "black", linewidth = 0.45),
+    axis.text  = element_text(color = "black"),
+    strip.text = element_text(face = "bold"),
+    strip.background = element_rect(fill = "grey92", color = NA)
+  )
+
+# Residual bars
+resid_df <- fit_treat_df %>%
+  mutate(Residual = sim - exp)
+
+gg_residual_bars <- ggplot(resid_df, aes(x = FAME, y = Residual, fill = Residual > 0)) +
+  geom_hline(yintercept = 0, color = "grey20", linewidth = 0.4) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  coord_flip() +
+  scale_x_discrete(drop = FALSE) +
+  scale_y_continuous(limits = c(-10, 10), breaks = seq(-10, 10, by = 5), labels = percent_format(scale = 1)) +
+  scale_fill_manual(values = c("TRUE" = "#D55E00", "FALSE" = "#0072B2")) +
+  labs(x = "Fatty acid residue", y = "Residual (Sim - Exp)") +
+  facet_wrap(~Treatment_ID, ncol = 2, scales = "free_y", labeller = facet_labeller) +
+  theme(
+    panel.grid = element_blank(),
+    axis.line  = element_line(color = "black", linewidth = 0.45),
+    axis.ticks = element_line(color = "black", linewidth = 0.45),
+    axis.text  = element_text(color = "black"),
+    strip.text = element_text(face = "bold"),
+    strip.background = element_rect(fill = "grey92", color = NA)
+  )
+
+# Combine panels (A, C, B like your original)
+pA <- gg_rep_vs_sim + theme(plot.margin = margin(6, 10, 6, 12))
+pB <- gg_fitness_scatter + theme(plot.margin = margin(6, 10, 6, 12))
+pC <- gg_residual_bars + theme(plot.margin = margin(6, 10, 6, 12))
+
+aligned <- cowplot::align_plots(pA, pB, pC, align = "v", axis = "l")
+panel_ABC <- cowplot::plot_grid(
+  aligned[[1]],
+  aligned[[3]],
+  aligned[[2]],
+  ncol = 1,
+  labels = c("A", "B", "C"),
+  label_size = 14,
+  rel_heights = c(1.4, 1.2, 1.2)
+)
+
+panel_ABC
+
+dir.create(file.path("outputs", "figures"), showWarnings = FALSE, recursive = TRUE)
+
+ggsave(
+  filename = file.path("outputs", "figures", "Figure3_simulation_vs_experimental.jpeg"),
+  plot = panel_ABC,
+  width = 7,
+  height = 10.5,
+  dpi = 300
+)
+
+```
+

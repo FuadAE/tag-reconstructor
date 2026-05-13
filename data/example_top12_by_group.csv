@@ -1,0 +1,73 @@
+"Treatment_ID","Type","FAME","Mean_abundance","rank"
+"High fat","LAE","C16:0",0.247673895145085,1
+"High fat","LAE","C18:1 (Z9)",0.174564775135415,2
+"High fat","LAE","C22:0",0.109962175217874,3
+"High fat","LAE","C14:0",0.076541714605119,4
+"High fat","LAE","C18:0",0.0697455466432214,5
+"High fat","LAE","C18:2 (Z9,12)",0.0528759264395671,6
+"High fat","LAE","C24:0",0.0491639067391127,7
+"High fat","LAE","C12:0",0.0470142094409134,8
+"High fat","LAE","C20:1 (Z11)",0.0377350105057438,9
+"High fat","LAE","Unknown 3",0.0294523134274847,10
+"High fat","LAE","C10:0",0.0226068352721603,11
+"High fat","LAE","C22:2 ???",0.0221692811096678,12
+"Low fat","LAE","C16:0",0.275274539555205,1
+"Low fat","LAE","C18:1 (Z9)",0.172525113890144,2
+"Low fat","LAE","C22:0",0.122922031025929,3
+"Low fat","LAE","C14:0",0.084325830718416,4
+"Low fat","LAE","C18:0",0.0816233627189164,5
+"Low fat","LAE","C24:0",0.0478946267828405,6
+"Low fat","LAE","C20:1 (Z11)",0.0411478566555657,7
+"Low fat","LAE","C18:2 (Z9,12)",0.02785880651697,8
+"Low fat","LAE","C12:0",0.0271429250749821,9
+"Low fat","LAE","C22:2 ???",0.0239607415489532,10
+"Low fat","LAE","C10:0",0.0207351158102295,11
+"Low fat","LAE","C16:1 (Z9)",0.0139791896714605,12
+"High fat","Lipase transeserification","C16:0",0.24206331971451,1
+"High fat","Lipase transeserification","C18:1 (Z9)",0.188396331992187,2
+"High fat","Lipase transeserification","C22:0",0.124224904937307,3
+"High fat","Lipase transeserification","C14:0",0.105674434008009,4
+"High fat","Lipase transeserification","C24:0",0.0600288928816984,5
+"High fat","Lipase transeserification","C10:0",0.0581500837740858,6
+"High fat","Lipase transeserification","C12:0",0.048329296412008,7
+"High fat","Lipase transeserification","C8:0",0.0336852030660275,8
+"High fat","Lipase transeserification","C22:2 ???",0.0330979102621894,9
+"High fat","Lipase transeserification","C4:0",0.0288964061670987,10
+"High fat","Lipase transeserification","C18:0",0.0246929360269095,11
+"High fat","Lipase transeserification","C6:0",0.0210240034772532,12
+"Low fat","Lipase transeserification","C22:0",0.222018860652592,1
+"Low fat","Lipase transeserification","C16:0",0.197988372417483,2
+"Low fat","Lipase transeserification","C24:0",0.121510762250588,3
+"Low fat","Lipase transeserification","C18:1 (Z9)",0.0929086926170024,4
+"Low fat","Lipase transeserification","C14:0",0.0749601604250137,5
+"Low fat","Lipase transeserification","C22:2 ???",0.0745040632115212,6
+"Low fat","Lipase transeserification","C10:0",0.0492696072428593,7
+"Low fat","Lipase transeserification","C20:1 (Z11)",0.0391890231393416,8
+"Low fat","Lipase transeserification","C8:0",0.0291617802375878,9
+"Low fat","Lipase transeserification","C12:0",0.0239544088462631,10
+"Low fat","Lipase transeserification","C18:0",0.0228212077430878,11
+"Low fat","Lipase transeserification","C4:0",0.0227600095739216,12
+"High fat","SAE","C16:0",0.270871146123243,1
+"High fat","SAE","C18:1 (Z9)",0.196476325285592,2
+"High fat","SAE","C14:0",0.0877201633477489,3
+"High fat","SAE","C18:0",0.0828987312531685,4
+"High fat","SAE","C22:0",0.0692920476354332,5
+"High fat","SAE","C18:2 (Z9,12)",0.0579141486958809,6
+"High fat","SAE","C12:0",0.0494242921353698,7
+"High fat","SAE","C24:0",0.0279843962208104,8
+"High fat","SAE","C20:1 (Z11)",0.0263830109227224,9
+"High fat","SAE","Unknown 3",0.0258616497744554,10
+"High fat","SAE","C10:0",0.0206238923869124,11
+"High fat","SAE","C22:2 ???",0.0163229871814966,12
+"Low fat","SAE","C16:0",0.272926505618363,1
+"Low fat","SAE","C18:1 (Z9)",0.181195080795551,2
+"Low fat","SAE","C22:0",0.110637162073462,3
+"Low fat","SAE","C18:0",0.0882318310622784,4
+"Low fat","SAE","C14:0",0.0829087882530164,5
+"Low fat","SAE","C24:0",0.0457222324652791,6
+"Low fat","SAE","C20:1 (Z11)",0.0381804328056901,7
+"Low fat","SAE","C18:2 (Z9,12)",0.0252425638341605,8
+"Low fat","SAE","C12:0",0.0249775153614599,9
+"Low fat","SAE","C22:2 ???",0.0233379133829969,10
+"Low fat","SAE","C10:0",0.0188231738976296,11
+"Low fat","SAE","Unknown 3",0.0181755522355236,12

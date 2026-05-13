@@ -1,2 +1,2 @@
 # tag-reconstructor
-Optimization-based reconstruction of fatty acid profiles from TAG mixtures in R
+This project implements a bottom-up optimization framework to reconstruct a combinatorial set of triacylglyceride (TAG) molecules that best reproduces an experimental fatty acid methyl ester (FAME) profile. Starting from measured FAME proportions, the method identifies the optimal combination and relative abundances of TAGs whose collective fatty acid composition matches the observed data.
